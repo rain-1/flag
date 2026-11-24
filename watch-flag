@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+import argparse
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+
+
+def watch_with_udp(command, host, port):
+    family, socktype, protocol, _, address = socket.getaddrinfo(
+        host, port, type=socket.SOCK_DGRAM
+    )[0]
+    with socket.socket(family, socktype, protocol) as sender:
+        sender.setblocking(False)
+        with subprocess.Popen(
+            command, stdout=subprocess.PIPE, text=True, start_new_session=True
+        ) as tracer:
+            def forward_signal(signum, _frame):
+                tracer.send_signal(signum)
+
+            previous_int = signal.signal(signal.SIGINT, forward_signal)
+            previous_term = signal.signal(signal.SIGTERM, forward_signal)
+            try:
+                for line in tracer.stdout:
+                    if line == "flag-read\n":
+                        try:
+                            sender.sendto(b"flag-read", address)
+                        except OSError as error:
+                            print(f"watch-flag: UDP send failed: {error}", file=sys.stderr)
+                    else:
+                        print(line, end="", flush=True)
+                status = tracer.wait()
+                return 128 - status if status < 0 else status
+            finally:
+                tracer.terminate()
+                signal.signal(signal.SIGINT, previous_int)
+                signal.signal(signal.SIGTERM, previous_term)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Count Linux reads of a flag file.")
+    parser.add_argument("path", nargs="?", default="flag.txt")
+    parser.add_argument(
+        "--udp", nargs=2, metavar=("HOST", "PORT"),
+        help="send a UDP notification for each counted event",
+    )
+    args = parser.parse_args()
+    if args.udp:
+        host, port_text = args.udp
+        try:
+            port = int(port_text)
+        except ValueError:
+            port = 0
+        if not 1 <= port <= 65535:
+            parser.error("UDP port must be an integer from 1 to 65535")
+
+    bpftrace = shutil.which("bpftrace")
+    if bpftrace is None:
+        parser.exit(1, "watch-flag: bpftrace is required\n")
+
+    try:
+        try:
+            fd = os.open(args.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            fd = os.open(args.path, os.O_PATH | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                parser.exit(1, "watch-flag: target must be a regular file\n")
+
+            # The kernel's dev_t uses 20 bits for the minor number.
+            device = (os.major(info.st_dev) << 20) | os.minor(info.st_dev)
+            program = Path(__file__).resolve().with_name("watch-flag.bt")
+            command = [
+                bpftrace, "-B", "line", str(program), str(info.st_ino),
+                str(device), str(int(bool(args.udp))),
+            ]
+            if args.udp:
+                return watch_with_udp(command, host, port)
+
+            # Keep the watched inode alive if the path is removed during tracing.
+            os.set_inheritable(fd, True)
+            os.execv(bpftrace, command)
+        finally:
+            os.close(fd)
+    except OSError as error:
+        parser.exit(1, f"watch-flag: {error}\n")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

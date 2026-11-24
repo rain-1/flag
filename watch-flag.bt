@@ -1,0 +1,35 @@
+BEGIN
+{
+  @read_attempts = sum(0);
+}
+
+fentry:security_file_permission
+/args.mask & 4/
+{
+  // MAY_READ is 4.
+  $inode = args.file->f_inode;
+  if ($inode->i_ino == (uint64)$1 && $inode->i_sb->s_dev == (uint32)$2) {
+    @read_attempts = sum(1);
+    if ($3 != 0) {
+      printf("flag-read\n");
+    }
+  }
+}
+
+fentry:security_mmap_file
+/args.file != 0 && (args.prot & 1)/
+{
+  // PROT_READ is 1.
+  $inode = args.file->f_inode;
+  if ($inode->i_ino == (uint64)$1 && $inode->i_sb->s_dev == (uint32)$2) {
+    @read_attempts = sum(1);
+    if ($3 != 0) {
+      printf("flag-read\n");
+    }
+  }
+}
+
+interval:s:1
+{
+  print(@read_attempts);
+}
